@@ -725,6 +725,98 @@ DROP TRIGGER IF EXISTS period_closing_lines_frozen_trg ON period_closing_lines;
 CREATE TRIGGER period_closing_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON period_closing_lines
     FOR EACH ROW EXECUTE FUNCTION period_closing_lines_frozen();
+
+-- 权利人对外付款暂停（财务在权利人收款资料有争议时暂停其对外付款）：
+-- 财务凭"权利人编号 holder_code + 调用方全局唯一暂停号 suspension_ref +
+-- 原因 reason"登记一次暂停。
+--   active   暂停中：同一权利人至多一条（部分唯一索引强制；对同一权利人
+--                    未解除即重复登记 409，即使使用新暂停号）；
+--                    暂停期间直接付款、创建付款预留、确认既有预留一律拒绝，
+--                    不产生付款、不改变任何指令；既有待确认预留保留额度，仍可取消。
+--   released 已解除：终态，只允许 active -> released（触发器强制，凭暂停号解除）；
+--                    解除不自动支付，此后按当时余额与预留规则办理；
+--                    解除后同一暂停号不复活，可用"新暂停号"对同一权利人重新暂停。
+-- suspension_ref 全局唯一：同号同内容（同权利人、同原因）重试幂等返回原暂停，
+-- 同号异内容 409 suspension_ref_conflict；未知权利人 404 holder_not_found；
+-- 未知暂停号解除/查询 404 payment_suspension_not_found。
+CREATE TABLE IF NOT EXISTS payment_suspensions (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    suspension_ref text NOT NULL UNIQUE,
+    holder_code    text NOT NULL REFERENCES rightsholders(code),
+    reason         text NOT NULL,
+    status         text NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'released')),
+    activated_at   timestamptz NOT NULL DEFAULT now(),
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    released_at    timestamptz
+);
+-- 一个权利人至多一条未解除暂停（并发/重复开启在此兜底，正常路径行锁下先行拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS payment_suspensions_one_active_per_holder
+    ON payment_suspensions(holder_code)
+    WHERE status = 'active';
+-- 付款/预留校验当前未解除暂停的主查询索引
+CREATE INDEX IF NOT EXISTS payment_suspensions_holder_active_idx
+    ON payment_suspensions(holder_code, status);
+
+-- 暂停操作记录（只追加）：开启与解除各至多一条（按事件类型去重），
+-- 幂等重试/被拒绝请求不产生记录。解除记录的原因沿用开启时的内容。
+CREATE TABLE IF NOT EXISTS payment_suspension_events (
+    id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    suspension_id  bigint NOT NULL REFERENCES payment_suspensions(id),
+    event_type     text NOT NULL CHECK (event_type IN ('opened', 'released')),
+    reason         text NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (suspension_id, event_type)
+);
+CREATE INDEX IF NOT EXISTS payment_suspension_events_suspension_idx
+    ON payment_suspension_events(suspension_id, id);
+
+-- 暂停头守卫：禁止删除；内容字段冻结，唯一允许的变更是 active -> released
+-- （仅 status 与 released_at 变化）。应用层在持锁事务内完成解除。
+CREATE OR REPLACE FUNCTION payment_suspensions_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment suspensions must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status = 'active'
+       AND NEW.status = 'released'
+       AND NEW.id IS NOT DISTINCT FROM OLD.id
+       AND NEW.suspension_ref IS NOT DISTINCT FROM OLD.suspension_ref
+       AND NEW.holder_code IS NOT DISTINCT FROM OLD.holder_code
+       AND NEW.reason IS NOT DISTINCT FROM OLD.reason
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.created_at IS NOT DISTINCT FROM OLD.created_at THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'payment suspension content is frozen and only an active '
+                  'suspension may be released';
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_suspensions_guarded_trg ON payment_suspensions;
+CREATE TRIGGER payment_suspensions_guarded_trg
+    BEFORE UPDATE OR DELETE ON payment_suspensions
+    FOR EACH ROW EXECUTE FUNCTION payment_suspensions_guarded();
+
+-- 暂停操作记录一经写入即禁止修改/删除
+CREATE OR REPLACE FUNCTION payment_suspension_events_frozen() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = 'insufficient_privilege',
+        MESSAGE = 'payment suspension events are frozen and must not be '
+                  || TG_OP || 'd';
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_suspension_events_frozen_trg
+    ON payment_suspension_events;
+CREATE TRIGGER payment_suspension_events_frozen_trg
+    BEFORE UPDATE OR DELETE ON payment_suspension_events
+    FOR EACH ROW EXECUTE FUNCTION payment_suspension_events_frozen();
 """
 
 

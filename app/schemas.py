@@ -331,6 +331,8 @@ class HolderLedger(BaseModel):
     refunds: list[LedgerRefundItem]
     # 预留指令（pending/cancelled/confirmed，历史只追加不改写）
     instructions: list["LedgerInstructionItem"] = []
+    # 当前未解除付款暂停（收款资料有争议）；无则 None
+    payment_suspension: "LedgerPaymentSuspension | None" = None
 
 
 # ---- 付款额度预留指令（先预留、后确认付款）----
@@ -672,8 +674,8 @@ class PlayDisputeOut(BaseModel):
     operations: list[PlayDisputeOperation] = []
 
 
-# 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用
-HolderLedger.model_rebuild()
+# 解析 HolderLedger 中对 LedgerInstructionItem 的前向引用（LedgerPaymentSuspension
+# 在文件末尾定义，统一在文件结尾 model_rebuild，见下）
 
 
 # ---- 财务期间关账（封存已出单期间）/ 解除 ----
@@ -728,3 +730,49 @@ class ClosingPreview(BaseModel):
     pending_count_closed: int
     pending_count_current: int
     payables: list[ClosingPreviewPayable] = []
+
+
+# ---- 权利人对外付款暂停（收款资料有争议时暂停付款）----
+
+class PaymentSuspensionIn(BaseModel):
+    # 权利人编号（未知 404 holder_not_found）
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 调用方全局唯一暂停号（同号同内容重试幂等、异内容 409）
+    suspension_ref: str = Field(min_length=1, max_length=200)
+    # 暂停原因（原样保存并随查询/操作记录返回）
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class PaymentSuspensionOperation(BaseModel):
+    # opened=登记暂停；released=解除（幂等重试与被拒绝请求不留操作记录）
+    operation: str
+    reason: str
+    at: datetime
+
+
+class PaymentSuspensionOut(BaseModel):
+    suspension_ref: str
+    holder_code: str
+    # 请求级状态：created=本次登记；released=本次解除；
+    # duplicate=同号同内容重试或重复解除；查询时与 suspension_status 一致
+    status: str
+    # 暂停自身状态：active=暂停中 | released=已解除
+    suspension_status: str
+    reason: str
+    activated_at: datetime
+    released_at: datetime | None = None
+    # 开启/解除操作记录（按发生次序，只追加）
+    operations: list[PaymentSuspensionOperation] = []
+
+
+# 对账单中的当前未解除付款暂停条目（财务核对可见）
+class LedgerPaymentSuspension(BaseModel):
+    suspension_ref: str
+    reason: str
+    # active=暂停中（对账单仅返回未解除暂停）
+    suspension_status: str
+    activated_at: datetime
+
+
+# HolderLedger 前向引用 LedgerInstructionItem / LedgerPaymentSuspension 均已定义，统一解析
+HolderLedger.model_rebuild()

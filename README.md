@@ -159,6 +159,26 @@ Python + FastAPI + PostgreSQL 实现的播放版税结算服务，支持：
   - **关账、解除与出单按期间串行**（共用"期间事务咨询锁"，关账号锁 →
     期间锁）：**关账快照严格对应最后一张已出单据，关账后不漏出单**；
     普通（未关账）期间的出单、查询仍按现有约定执行。
+- **权利人对外付款暂停（收款资料有争议时暂停付款）**：
+  - 财务凭 **权利人编号、全局唯一暂停号与原因** 登记暂停，返回暂停状态与
+    开启/解除操作记录；**同号同内容重试幂等返回原记录**（200 `duplicate`），
+    **同号异内容复用**（权利人或原因不同）**409** `suspension_ref_conflict`，
+    **未知权利人 404** `holder_not_found`，**对同一权利人未解除即重复登记**
+    （含换新暂停号）**409** `payment_suspension_already_active`，拒绝不留记录；
+  - **暂停期间直接付款、创建付款预留、确认既有待确认预留一律 409
+    `holder_payments_suspended` 拒绝**，**不产生付款、不改变任何指令**；
+    **既有待确认预留保留额度并可取消**（取消不涉及对外付款）；
+    **已完成付款及已确认预留的同内容重试仍按原接口约定幂等返回**；
+    **出单、试算、退票与余额核对继续按原口径运行**，不受暂停影响；
+  - **凭暂停号解除**：`active → released`，**重复解除幂等**（200 `duplicate`），
+    未知暂停号解除/查询 **404** `payment_suspension_not_found`；
+    **解除不自动支付**，此后按当时余额与预留规则办理；解除后可用新暂停号重开，
+    旧暂停号同内容重试仍返回已解除结果（不复活）；
+  - **并发按同一权利人的提交先后决定结果**：登记暂停与直接付款、创建/确认预留
+    共用"业务流水号咨询锁 → 权利人行锁"次序，暂停先生效则其后付款/确认必被拒、
+    付款/确认先提交则暂停必在其后生效，**不超付、无死锁**；对账单新增当前
+    **活跃暂停块 `payment_suspension`**（无则为 `null`）；暂停头与操作记录
+    **只追加、不可修改/删除**（触发器强制，唯一允许的变更是 `active → released`）。
 
 ## 一键启动
 
@@ -298,6 +318,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/period-closings` | 凭唯一关账号 + 期间起止封存已出单期间；新关账 201，同号同期间重试 200，异期间复用 409，同期间重复关账 409，无已出单据 409 |
 | POST | `/period-closings/{close_ref}/release` | 凭关账号解除；新解除 200，重复解除幂等 200；未知关账号 404 |
 | GET | `/period-closings/{close_ref}` | 查询关账快照（最新单号、各权利人累计应付、待处理数量、状态）；未知关账号 404 |
+
+### 权利人对外付款暂停（收款资料有争议）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/payment-suspensions` | 凭权利人编号 + 全局唯一暂停号 + 原因暂停其对外付款；新登记 201，同号同内容重试 200，异内容复用 409，未解除重复登记 409，未知权利人 404 |
+| POST | `/payment-suspensions/{suspension_ref}/release` | 凭暂停号解除；新解除 200，重复解除幂等 200；未知暂停号 404 |
+| GET | `/payment-suspensions/{suspension_ref}` | 查询暂停（权利人、状态、原因与开启/解除操作记录）；未知暂停号 404 |
 
 `POST /payments` 请求体：
 
@@ -1155,6 +1183,127 @@ curl -sS -i -X POST http://localhost:8000/payment-reservations/CMD-2/confirm \
 curl -sS http://localhost:8000/rightsholders/RS-R/ledger | python3 -m json.tool
 ```
 
+### 权利人对外付款暂停（收款资料有争议）
+
+财务在权利人收款资料有争议时，可先暂停该权利人的对外付款，待资料核实后凭暂停号
+解除；解除只恢复"可按规则办理"，**不会自动支付**任何被拦下的款项。
+
+`POST /payment-suspensions` 请求体：
+
+```json
+{
+  "holder_code": "RS-A",
+  "suspension_ref": "SUSP-20261003-0001",
+  "reason": "收款账户资料待银行核验，暂停对外付款"
+}
+```
+
+- `holder_code` 为权利人编号（未知 → 404 `holder_not_found`）；`suspension_ref`
+  为调用方提供的**全局唯一暂停号**；`reason` 为暂停原因（原样保存）。
+- 成功响应（201，`status=created`）返回暂停状态与开启/解除操作记录：
+
+```json
+{
+  "suspension_ref": "SUSP-20261003-0001",
+  "holder_code": "RS-A",
+  "status": "created",
+  "suspension_status": "active",
+  "reason": "收款账户资料待银行核验，暂停对外付款",
+  "activated_at": "2026-10-03T10:00:00Z",
+  "released_at": null,
+  "operations": [
+    {"operation": "opened", "reason": "收款账户资料待银行核验，暂停对外付款",
+     "at": "2026-10-03T10:00:00Z"}
+  ]
+}
+```
+
+- **同号同内容**（同权利人、同原因）重试：HTTP 200、`status="duplicate"`，
+  返回原暂停（不新增操作记录，`active`/`released` 均如此，已解除旧号不复活）；
+  **同号异内容**（权利人或原因不同）：**409 `suspension_ref_conflict`**
+  （`detail` 回显原权利人/原因/状态）。
+- **对同一权利人未解除即重复登记**（即使换一个新暂停号）：**409
+  `payment_suspension_already_active`**（`detail.existing_suspension_ref`
+  回显当前活跃暂停号），拒绝且**不留任何记录**。
+- **暂停效力**（暂停期间对该权利人）：
+  - **直接付款** `POST /payments` → **409 `holder_payments_suspended`**，
+    不产生付款；
+  - **创建付款预留** `POST /payment-reservations` → **409
+    `holder_payments_suspended`**，不留指令；
+  - **确认既有待确认预留** `POST /payment-reservations/{ref}/confirm` → **409
+    `holder_payments_suspended`**，指令**保持 pending 不变、不产生付款**；
+  - **既有待确认预留保留额度，仍可取消**
+    `POST /payment-reservations/{ref}/cancel`（取消不涉及对外付款）；
+  - **已完成付款、已确认预留的同内容重试**仍按原接口约定 **200 幂等返回
+    原记录**（不新增付款）；**出单、试算、退票与余额核对不受影响**，继续按原口径。
+  - 409 响应 `detail` 形如
+    `{holder_code, suspension_ref, suspension_status:"active"}`。
+- 对账单 `GET /rightsholders/{code}/ledger` 新增 **`payment_suspension`** 块
+  （当前活跃暂停的暂停号/原因/状态/开启时间），无活跃暂停时为 `null`；
+  其余金额口径（`balance`、`reserved_total`、`available_balance` 等）**完全不变**。
+
+解除：`POST /payment-suspensions/{suspension_ref}/release`（无请求体）：
+
+- `active → released`，HTTP 200、`status="released"`，返回原暂停（`operations`
+  追加一条 `released`）；**重复解除幂等**：HTTP 200、`status="duplicate"`；
+  **未知暂停号**：404 `payment_suspension_not_found`。
+- **解除后不自动支付**：直接付款、创建/确认预留恢复为按**当时余额与预留规则**
+  办理（可用额不足、FIFO 等既有约束照常生效）；此后**可用新暂停号重新暂停**。
+
+手工调用关键几步（独立演示作品 `W-SUS-001`，`RS-SUS` 100%）：
+
+```bash
+# 建档、出单 100 分（略，见示例脚本）；先预留 60 分
+curl -sS -X POST http://localhost:8000/payment-reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","instruction_ref":"CMD-SUS-1","amount":60}'
+
+# 1) 登记暂停 => 201 created（active）
+curl -sS -X POST http://localhost:8000/payment-suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","suspension_ref":"SUSP-20261003-0001",
+       "reason":"收款账户资料待银行核验"}'
+
+# 2) 同号同内容重试 => 200 duplicate；异原因/异权利人 => 409；换号重复登记 => 409
+curl -sS -i -X POST http://localhost:8000/payment-suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","suspension_ref":"SUSP-20261003-0001",
+       "reason":"收款账户资料待银行核验"}' | head -1
+curl -sS -i -X POST http://localhost:8000/payment-suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","suspension_ref":"SUSP-20261003-0001","reason":"别的"}' | head -1
+curl -sS -i -X POST http://localhost:8000/payment-suspensions \
+  -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","suspension_ref":"SUSP-OTHER","reason":"又一争议"}' | head -1
+
+# 3) 暂停期间：直接付款 / 新建预留 / 确认既有预留 全部 409（不留痕、不改指令）
+curl -sS -i -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","external_ref":"BANK-X","amount":10}' | head -1
+curl -sS -i -X POST http://localhost:8000/payment-reservations -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-SUS","instruction_ref":"CMD-NEW","amount":10}' | head -1
+curl -sS -i -X POST http://localhost:8000/payment-reservations/CMD-SUS-1/confirm \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-Y"}' | head -1
+
+# 4) 既有待确认预保留额、仍可取消（取消不付款，暂停期间照常）
+curl -sS -X POST http://localhost:8000/payment-reservations/CMD-SUS-1/cancel
+
+# 5) 出单/试算/退票/余额核对照常；对账单带 payment_suspension 块
+curl -sS http://localhost:8000/rightsholders/RS-SUS/ledger | python3 -m json.tool
+
+# 6) 凭暂停号解除 => released；重复解除 => duplicate；未知号 => 404
+curl -sS -X POST http://localhost:8000/payment-suspensions/SUSP-20261003-0001/release
+curl -sS -X POST http://localhost:8000/payment-suspensions/SUSP-20261003-0001/release
+curl -sS -i -X POST http://localhost:8000/payment-suspensions/UNKNOWN/release | head -1
+
+# 7) 解除不自动支付：按当时余额与预留规则恢复办理；之后可用新暂停号重开
+```
+
+完整自包含演示：
+
+```bash
+BASE=http://localhost:8000 bash examples/payment_suspensions_demo.sh
+```
+
 ## 分摊示例
 
 金额 100，比例 62.5% / 30% / 7.5%：
@@ -1199,7 +1348,13 @@ python3 -m unittest discover -s tests -v
 累计应付及待处理数量/同号同期间重试幂等/异期间复用与同期间重复关账 409/
 关账后出单 409 且历史单据归因不变/更正协议争议照常/试算实时应付与关账差额/
 解除幂等/解除后追补差额相对关账累计/解除后再关拒绝/关账解除出单并发按期间
-串行快照对应最后一张单据且不漏出单）
+串行快照对应最后一张单据且不漏出单）、
+权利人对外付款暂停（登记幂等同内容/异内容复用与未解除重复登记 409/未知权利人 404/
+暂停期间直接付款新建预留确认既有预留一律拒绝不留痕不改指令/既有待确认预保留额可取消/
+已完成付款及确认的同内容重试仍幂等/出单试算退票余额核对照常/
+解除幂等与未知暂停号 404/解除不自动支付且可新号重开/
+暂停与付款预留创建确认并发按同一权利人提交先后决定不超付无死锁/
+同号并发恰一笔/对账单活跃暂停块/暂停头与操作记录触发器不可变）
 各有一套：
 
 ```bash
@@ -1213,6 +1368,7 @@ PYTHONPATH=. python3 tests/integration_receipts.py              # 银行回单�
 PYTHONPATH=. python3 tests/integration_balance_snapshots.py     # 余额核对底稿一次性冻结
 PYTHONPATH=. python3 tests/integration_disputes.py              # 播放更正链计费争议暂缓/解除
 PYTHONPATH=. python3 tests/integration_closings.py              # 财务期间关账/解除
+PYTHONPATH=. python3 tests/integration_payment_suspensions.py   # 权利人对外付款暂停/解除
 ```
 
 ## 目录结构
@@ -1232,6 +1388,7 @@ app/
   balance_snapshots_service.py  # 余额核对底稿一次性冻结（快照号锁 + 单语句已提交视图；同集合幂等/异集合拒绝、分页）
   disputes_service.py     # 播放更正链计费争议（争议号锁→链根锁；登记暂缓/解除幂等/同链重复开启拒绝；链锚定整链）
   closings_service.py     # 财务期间关账/解除（关账号锁→期间锁；快照冻结/幂等/异期间与重复关账拒绝/解除幂等；与出单按期间串行）
+  suspensions_service.py  # 权利人对外付款暂停（暂停号锁→权利人行锁；登记幂等/异内容与未解除重复登记拒绝/解除幂等；付款/预留门禁）
   routers/
     catalog.py            # 作品 / 权利人 / 协议（含协议区间互斥）
     plays.py              # 播放导入、幂等、更正链
@@ -1240,12 +1397,14 @@ app/
     statements.py         # 单据出具（关账期间拒绝）、试算（含实时 vs 关账差额）、查询、逐笔归因分页查询
     payments.py           # 付款登记、按权利人对账
     reservations.py       # 付款额度预留：创建 / 确认 / 取消 / 单条查询
+    payment_suspensions.py# 权利人对外付款暂停：登记 / 解除 / 查询
     refunds.py            # 银行退票登记
     receipts.py           # 回单批次导入、复核、版本查询
     balance_snapshots.py  # 余额核对底稿：冻结 / 分页读取
 examples/demo.sh          # 端到端 curl 示例（含付款额度预留两阶段与负额追补 FIFO）
 examples/disputes_demo.sh # 播放更正链计费争议暂缓/解除端到端 curl 示例
 examples/closings_demo.sh # 财务期间关账/解除端到端 curl 示例
-tests/                    # 单元测试与九套 pgserver 端到端集成测试
+examples/payment_suspensions_demo.sh # 权利人对外付款暂停/解除端到端 curl 示例
+tests/                    # 单元测试与十套 pgserver 端到端集成测试
 Dockerfile  docker-compose.yml  requirements.txt
 ```

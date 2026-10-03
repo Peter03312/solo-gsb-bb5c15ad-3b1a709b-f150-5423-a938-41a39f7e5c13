@@ -186,6 +186,12 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
         if holder is None:
             raise _holder_not_found(holder_code)
 
+        # 收款资料争议暂停门禁：暂停生效后不得新增直接付款。
+        # 在权利人行锁事务内检查，与登记暂停按同一权利人的提交先后串行；
+        # 拒绝时不产生付款、不改变任何指令。
+        from .suspensions_service import ensure_not_suspended
+        ensure_not_suspended(conn, holder_code)
+
         balance = get_balance(conn, holder_code)
         reserved = get_reserved_total(conn, holder_code)
         available = balance - reserved
@@ -320,6 +326,16 @@ def get_holder_ledger(conn, holder_code: str):
         (holder_code,),
     ).fetchall()
 
+    # 当前未解除（active）的对外付款暂停；无则 None（只读快照，不影响余额口径）
+    active_susp = conn.execute(
+        """
+        SELECT suspension_ref, reason, status, activated_at
+        FROM payment_suspensions
+        WHERE holder_code = %s AND status = 'active'
+        """,
+        (holder_code,),
+    ).fetchone()
+
     billed_total = sum(int(r["amount"]) for r in statement_rows)
     paid_total = sum(int(r["amount"]) for r in payment_rows)
     refunded_total = sum(int(r["amount"]) for r in refund_rows)
@@ -338,6 +354,15 @@ def get_holder_ledger(conn, holder_code: str):
         "reserved_total": reserved_total,
         "balance": balance,
         "available_balance": balance - reserved_total,
+        # 当前未解除付款暂停（收款资料争议）；无则 None
+        "payment_suspension": (
+            None if active_susp is None else {
+                "suspension_ref": active_susp["suspension_ref"],
+                "reason": active_susp["reason"],
+                "suspension_status": active_susp["status"],
+                "activated_at": active_susp["activated_at"],
+            }
+        ),
         "statements": [
             {
                 "batch_id": r["batch_id"],

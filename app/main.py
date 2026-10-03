@@ -9,6 +9,7 @@ from .errors import APIError
 from .routers import (
     balance_snapshots,
     catalog,
+    payment_suspensions,
     payments,
     period_closings,
     play_disputes,
@@ -29,7 +30,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="演出录音播放版税结算服务",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "登记作品与分成协议、导入播放记录（支持幂等与更正链）、"
         "按播放发生时间匹配协议并逐笔按比例分摊，按期间出具应付/追补单据，"
@@ -47,7 +48,14 @@ app = FastAPI(
         "并按唯一关账号封存已出单期间（冻结最新单号/各权利人累计应付/待处理数量，"
         "关账后拒绝该期间出单、历史单据与归因不变，试算展示实时应付与关账差额；"
         "同号同期间重试幂等、异期间复用与同期间重复关账拒绝；凭关账号解除后"
-        "可按既有规则出具追补，重复解除幂等；关账、解除与出单按期间串行）。"
+        "可按既有规则出具追补，重复解除幂等；关账、解除与出单按期间串行），"
+        "并在权利人收款资料有争议时凭权利人编号/全局唯一暂停号/原因暂停其对外"
+        "付款（同号同内容重试幂等、异内容复用与未解除重复登记拒绝；暂停期间"
+        "直接付款、创建预留、确认既有预留一律拒绝且不产生付款或改变指令，"
+        "既有待确认预保留额可取消，已完成付款及确认的同内容重试仍幂等返回，"
+        "出单/试算/退票/余额核对照常；凭暂停号解除、重复解除幂等，解除后"
+        "按当时余额与预留规则办理且不自动支付；暂停与付款/预留按同一权利人"
+        "提交先后串行）。"
     ),
     lifespan=lifespan,
 )
@@ -62,6 +70,7 @@ app.include_router(refunds.router)
 app.include_router(receipts.router)
 app.include_router(balance_snapshots.router)
 app.include_router(period_closings.router)
+app.include_router(payment_suspensions.router)
 
 
 @app.get("/health", tags=["system"])

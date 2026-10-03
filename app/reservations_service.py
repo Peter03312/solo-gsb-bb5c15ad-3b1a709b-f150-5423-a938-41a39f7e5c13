@@ -116,6 +116,11 @@ def create_reservation(conn, holder_code: str, instruction_ref: str, amount: int
         if holder is None:
             raise _holder_not_found(holder_code)
 
+        # 收款资料争议暂停门禁：暂停生效后不得新增付款预留。
+        # 行锁内检查，与登记暂停按同一权利人的提交先后串行；拒绝不留指令。
+        from .suspensions_service import ensure_not_suspended
+        ensure_not_suspended(conn, holder_code)
+
         balance = get_balance(conn, holder_code)
         reserved = get_reserved_total(conn, holder_code)
         available = balance - reserved
@@ -254,6 +259,12 @@ def confirm_reservation(conn, instruction_ref: str, external_ref: str) -> dict:
         ).fetchone()
         if holder is None:  # 外键已建档，理论不可达
             raise _holder_not_found(holder_code)
+
+        # 收款资料争议暂停门禁：暂停生效后既有待确认预留也不得确认
+        # （额度保留、仍可取消）；拒绝时不产生付款、指令保持 pending 不变。
+        # 行锁内检查，与登记暂停按同一权利人的提交先后串行。
+        from .suspensions_service import ensure_not_suspended
+        ensure_not_suspended(conn, holder_code)
 
         balance = get_balance(conn, holder_code)
         # 更早创建（id 更小）的待确认指令合计：确认后这些预留仍须留足。
