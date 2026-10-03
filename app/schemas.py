@@ -325,12 +325,23 @@ class HolderLedger(BaseModel):
     balance: int
     # 可用额 = balance - reserved_total（新付款/新预留不得占用待确认预留）
     available_balance: int = 0
+    # 当前生效中的对外付款暂停（无则 None；暂停期间付款/新建预留/确认预留均拒绝）
+    active_payment_suspension: "LedgerPaymentSuspension | None" = None
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
     # 逐笔银行退回（原付款与单据不可变，退回只追加）
     refunds: list[LedgerRefundItem]
     # 预留指令（pending/cancelled/confirmed，历史只追加不改写）
     instructions: list["LedgerInstructionItem"] = []
+
+
+# 对账单中"生效中的对外付款暂停"摘要（历史暂停经暂停号查询接口获取）
+class LedgerPaymentSuspension(BaseModel):
+    suspension_ref: str
+    reason: str
+    # 对账单仅展示生效中暂停，恒为 active
+    suspension_status: str
+    activated_at: datetime
 
 
 # ---- 付款额度预留指令（先预留、后确认付款）----
@@ -728,3 +739,36 @@ class ClosingPreview(BaseModel):
     pending_count_closed: int
     pending_count_current: int
     payables: list[ClosingPreviewPayable] = []
+
+
+# ---- 权利人对外付款暂停（收款资料有争议时暂停付款）----
+
+class PaymentSuspensionIn(BaseModel):
+    # 权利人编号（未知 404 holder_not_found）
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 调用方唯一暂停号（全局唯一；同号同内容重试幂等、异内容 409）
+    suspension_ref: str = Field(min_length=1, max_length=200)
+    # 暂停原因（原样保存并随查询/操作记录返回）
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class PaymentSuspensionOperation(BaseModel):
+    # activated=登记暂停；released=解除（幂等重试与被拒绝请求不留操作记录）
+    operation: str
+    reason: str
+    at: datetime
+
+
+class PaymentSuspensionOut(BaseModel):
+    suspension_ref: str
+    holder_code: str
+    reason: str
+    # 请求级状态：created=本次登记；released=本次解除；
+    # duplicate=同号同内容重试或重复解除；查询时与 suspension_status 一致
+    status: str
+    # 暂停自身状态：active=暂停生效中 | released=已解除
+    suspension_status: str
+    activated_at: datetime
+    released_at: datetime | None = None
+    # 激活/解除操作记录（按发生次序，只追加）
+    operations: list[PaymentSuspensionOperation] = []

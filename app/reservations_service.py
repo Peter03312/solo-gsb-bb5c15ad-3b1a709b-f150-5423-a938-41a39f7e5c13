@@ -17,6 +17,10 @@
   即 balance >= earlier_pending + amount，否则 409
   payment_exceeds_balance 拒绝且指令不变（晚于本指令的预留不被保护，
   其确认时再各自校验）。
+- 收款资料争议暂停：创建与确认在权利人行锁后、余额/FIFO 校验前统一检查
+  active 暂停（生效中 409 rightsholder_payments_suspended，不留指令/付款、
+  指令保持 pending 不变）；取消不检查暂停（既有待确认预留仍可取消并释放
+  额度）；已确认指令的同流水号确认重试在终态分支幂等返回，不受暂停影响。
 
 并发协议（统一加锁次序，无死锁）：
 - 创建预留：指令号事务咨询锁 → 权利人行锁（FOR UPDATE）；
@@ -115,6 +119,11 @@ def create_reservation(conn, holder_code: str, instruction_ref: str, amount: int
         ).fetchone()
         if holder is None:
             raise _holder_not_found(holder_code)
+
+        # 收款资料争议暂停生效中：拒绝新建预留，不创建指令、不改任何状态。
+        from .payment_suspensions_service import reject_if_active
+
+        reject_if_active(conn, holder_code)
 
         balance = get_balance(conn, holder_code)
         reserved = get_reserved_total(conn, holder_code)
@@ -254,6 +263,12 @@ def confirm_reservation(conn, instruction_ref: str, external_ref: str) -> dict:
         ).fetchone()
         if holder is None:  # 外键已建档，理论不可达
             raise _holder_not_found(holder_code)
+
+        # 收款资料争议暂停生效中：拒绝确认既有预留，指令保持 pending 不变，
+        # 不产生付款（取消不受限，待确认额度继续保留）。
+        from .payment_suspensions_service import reject_if_active
+
+        reject_if_active(conn, holder_code)
 
         balance = get_balance(conn, holder_code)
         # 更早创建（id 更小）的待确认指令合计：确认后这些预留仍须留足。

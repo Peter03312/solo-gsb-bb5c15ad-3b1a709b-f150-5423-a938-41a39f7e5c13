@@ -7,6 +7,14 @@
 可用额口径：当前余额 − 该权利人全部待确认（pending）预留指令金额合计。
 预留创建、直接付款与预留确认都不得占用待确认预留。
 
+收款资料争议暂停口径：直接付款、预留创建与预留确认在取得权利人行锁后、
+余额/可用额校验前，统一检查该权利人是否存在 active 暂停
+（payment_suspensions_service.reject_if_active）：生效中一律 409
+rightsholder_payments_suspended，不产生付款、不创建/不改变预留指令；
+既有待确认预留保留额度且仍可取消；已完成付款/已确认预留的同内容幂等
+重试在更靠前的"原记录命中"分支返回，不受暂停影响。出单、试算、退票与
+余额核对不检查暂停，继续按原口径运行。
+
 并发协议（与出单互斥，杜绝超付/超退）：
 - 登记付款先取"外部流水号事务咨询锁"（序列化同一流水号的并发重试），
   再对该权利人行取行锁；余额/可用额校验与付款插入在同一事务内原子完成。
@@ -186,6 +194,12 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
         if holder is None:
             raise _holder_not_found(holder_code)
 
+        # 收款资料争议暂停生效中：拒绝直接付款，不产生付款、不改任何指令。
+        # （同流水号原记录命中的幂等重试已在上方返回，不受暂停影响。）
+        from .payment_suspensions_service import reject_if_active
+
+        reject_if_active(conn, holder_code)
+
         balance = get_balance(conn, holder_code)
         reserved = get_reserved_total(conn, holder_code)
         available = balance - reserved
@@ -328,6 +342,21 @@ def get_holder_ledger(conn, holder_code: str):
     )
     balance = billed_total - paid_total + refunded_total
 
+    # 当前生效中的收款资料暂停（无则 None；历史暂停可经暂停号查询）
+    from .payment_suspensions_service import active_suspension
+
+    susp = active_suspension(conn, holder_code)
+    active_payment_suspension = (
+        None
+        if susp is None
+        else {
+            "suspension_ref": susp["suspension_ref"],
+            "reason": susp["reason"],
+            "suspension_status": susp["status"],
+            "activated_at": susp["activated_at"],
+        }
+    )
+
     return {
         "holder_code": holder["code"],
         "name": holder["name"],
@@ -338,6 +367,8 @@ def get_holder_ledger(conn, holder_code: str):
         "reserved_total": reserved_total,
         "balance": balance,
         "available_balance": balance - reserved_total,
+        # 生效中的对外付款暂停（暂停期间付款/新建预留/确认预留均拒绝）
+        "active_payment_suspension": active_payment_suspension,
         "statements": [
             {
                 "batch_id": r["batch_id"],
